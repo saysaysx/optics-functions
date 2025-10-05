@@ -1,4 +1,6 @@
+#MIT License
 
+#Copyright (c) 2025 saysaysx
 
 import numpy as np
 import matplotlib.pyplot as plt
