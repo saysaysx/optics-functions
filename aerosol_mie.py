@@ -286,9 +286,17 @@ def miesct_tensor(rl=lam_refr(1),ang=numpy.array([0,pi/2]), r = numpy.array([1])
 
 
 
-def mieosct_tensor(rl=lam_refr(1), r = numpy.array([1])):
+def mieosct_tensor(rl=lam_refr(1), r=numpy.array([1])):
+    """
+    Упрощённая версия miesct_tensor без углового распределения.
+    Используется, когда нужны только интегральные параметры (Q_sca, Q_ext, Q_back).
+    Экономит память и время при массовых расчётах.
+    """
+    # ... (аналогично, но без расчёта полиномов Лежандра и S1/S2)
+
     nlam = rl.nlam
     nr = r.shape[0]
+
 
     lam = tf.cast(rl.lam,tf.float64)
     r = tf.cast(r,tf.float64)
@@ -297,24 +305,29 @@ def mieosct_tensor(rl=lam_refr(1), r = numpy.array([1])):
     # size nlam*nr
     x = 2.0*pi*r[None,:]/lam[:,None]
 
-    nmax = tf.reduce_max(x+4.0*x**(1.0/3.0)+2.0)
-    nmax = tf.cast(nmax,tf.int32)
+
+
+    # Индивидуальный nmax для каждой (i,j)
+    nmax_ij = x + 4.0 * tf.pow(x, 1.0/3.0) + 5.0  # (nlam, nr)
+    nmax_ij = tf.cast(tf.math.ceil(nmax_ij), tf.int32)
 
     m = refrp/refrm
     mx = tf.cast(x,tf.complex128)*m[:,None]
     xc = tf.cast(x,tf.complex128)
-
-    amx = tf.math.abs(mx)
-    maxmx = tf.cast(tf.reduce_max(amx),tf.int32)
+    amx = tf.cast(tf.math.abs(mx), tf.int32)
 
 
-    nd = tf.cast(tf.cast(tf.maximum(nmax,maxmx),tf.float64)/1.4,tf.int32)
+
+    nd = tf.cast(tf.cast(tf.reduce_max(tf.maximum(nmax_ij,amx)),tf.float64),tf.int32)+15
+    nmax_ij = tf.maximum(nmax_ij,amx)+15
 
     index = tf.cast(tf.range(0,nd+1),tf.complex128)
     indexf = tf.cast(tf.range(0,nd+1),tf.float64)
+    index_int = tf.cast(tf.range(0,nd+1),tf.int32)
 
     D = 1/mx[:,:,None]
     D = tf.repeat(D,nd+1,axis=2)
+
 
     D = tf.Variable(D*(index+1))#numpy.array([complex((i+1)/mx) for i in range(nd+1)])
 
@@ -324,23 +337,39 @@ def mieosct_tensor(rl=lam_refr(1), r = numpy.array([1])):
     for i in range(nd,-1,-1):
         D[:,:,i - 1].assign(D[:,:,i - 1] - 1.0 / (D[:,:,i] + D[:,:,i - 1]))
 
+
     zeros1 = tf.zeros([nlam,nr, nd+1],tf.float64)
     zerosc = tf.zeros([nlam,nr, nd+1],tf.complex128)
     psi = tf.Variable(zeros1)
     ksi = tf.Variable(zeros1)
 
-
     psi[:,:,0].assign(tf.math.sin(x))
-
 
     psi[:,:,1].assign(tf.math.sin(x)/x-tf.math.cos(x))
     ksi[:,:,0].assign(tf.math.cos(x))
     ksi[:,:,1].assign(tf.math.cos(x)/x+tf.math.sin(x))
 
-    for i in range(2,nd+1):
-        psi[:,:,i].assign(((2.0*(i-1)+1.0)*psi[:,:,i-1]/x)-psi[:,:,i-2])
-        ksi[:,:,i].assign(((2.0*(i-1)+1.0)*ksi[:,:,i-1]/x)-ksi[:,:,i-2])
+    # Создаём маску валидности для всех n
+    n_indices = tf.range(nd + 1, dtype=tf.int32)  # (nd+1,)
+    # valid_mask[i,j,n] = True, если n <= nmax_ij[i,j]
+    valid_mask = n_indices[None, None, :] <= nmax_ij[:, :, None]  # (nlam, nr, nd+1)
 
+    for i in range(2,nd+1):
+        # Вычисляем новые значения
+        new_psi = ((2.0 * (i - 1) + 1.0) * psi[:, :, i - 1] / x) - psi[:, :, i - 2]
+        new_ksi = ((2.0 * (i - 1) + 1.0) * ksi[:, :, i - 1] / x) - ksi[:, :, i - 2]
+
+        # Маска для текущего n = i: (nlam, nr)
+        mask_i = valid_mask[:, :, i]
+
+        # Обновляем ТОЛЬКО те элементы, где n=i допустимо
+        # Где маска False — оставляем старое значение (обычно 0)
+        psi_update = tf.where(mask_i, new_psi, psi[:, :, i])
+        ksi_update = tf.where(mask_i, new_ksi, ksi[:, :, i])
+
+        # Присваиваем
+        psi[:, :, i].assign(psi_update)
+        ksi[:, :, i].assign(ksi_update)
 
     eps = tf.complex(psi,-ksi)
 
@@ -354,15 +383,16 @@ def mieosct_tensor(rl=lam_refr(1), r = numpy.array([1])):
 
     tmp1 = D/m[:,None,None]+ix
     tmp2 = D*m[:,None,None]+ix
-
-    a[:,:,1:nd+1].assign((tmp1[:,:,1:] * psic[:,:,1:] - psic[:,:,0:-1]) / (tmp1[:,:,1:] * eps[:,:,1:] - eps[:,:,0:- 1]))
-    b[:,:,1:nd+1].assign((tmp2[:,:,1:] * psic[:,:,1:] - psic[:,:,0:-1]) / (tmp2[:,:,1:] * eps[:,:,1:] - eps[:,:,0: - 1]))
-
+    aa = tf.where(valid_mask[:,:,1:nd+1], (tmp1[:,:,1:] * psic[:,:,1:] - psic[:,:,0:-1]) / (tmp1[:,:,1:] * eps[:,:,1:] - eps[:,:,0:- 1]), 0.0)
+    a[:,:,1:nd+1].assign(aa)
+    bb = tf.where(valid_mask[:,:,1:nd+1],(tmp2[:,:,1:] * psic[:,:,1:] - psic[:,:,0:-1]) / (tmp2[:,:,1:] * eps[:,:,1:] - eps[:,:,0: - 1]), 0.0)
+    b[:,:,1:nd+1].assign(bb)
+ 
     qexta = tf.math.real((a+b)*(2*index+1))
     qext = tf.reduce_sum(qexta,axis=2)
     qscta = (tf.math.abs(a)**2+tf.math.abs(b)**2)*(2.0*indexf+1.0)
     qsct = tf.reduce_sum(qscta,axis=2)
-    qsctpica  = (a-b)*((-1)**index)*(2*index+1)
+    qsctpica  = (a-b)*tf.cast(1 - 2*tf.math.mod(index_int , 2), tf.complex128)*(2*index+1)
 
     qsctpi = abs(tf.reduce_sum(qsctpica,axis=2))**2/(x**2)
 
@@ -372,7 +402,7 @@ def mieosct_tensor(rl=lam_refr(1), r = numpy.array([1])):
     ext=qext*(r**2)*pi*1e-8
 
 
-    spi1 = qsctpi*(r**2)*1e-12
+    spi1 = qsctpi*(r**2)*pi*1e-8
     return ext,sct, spi1
 
 
