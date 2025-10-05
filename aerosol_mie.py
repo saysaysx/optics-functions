@@ -8,26 +8,58 @@ from math import *
 import numpy
 
 class optparsct:
+    """
+    Структура данных для хранения оптических параметров рассеяния:
+    - sct: полное сечение рассеяния (см²)
+    - ext: полное сечение поглощения + рассеяния (см²)
+    - spi: интенсивность обратного рассеяния (в 180°), вычисленная через нормированное угловое распределение
+    - spi1: коэффициент обратного рассеяния, вычисленный напрямую через Q_back = |Σ(a_n - b_n)(-1)^n(2n+1)|² / x²
+    - ind: нормированное угловое распределение интенсивности I(θ)
+    - sctang: дифференциальное сечение рассеяния dσ/dΩ = σ_sca * I(θ)
+    """
+    
     def __init__(self,n):
         self.sct = 0.0
         self.ext = 0.0
         self.spi = 0.0
         self.ind = numpy.zeros(n)
         self.sctang = numpy.zeros(n)
+        self.spi1 = 0.0 
 
 def miesctopt(refrp=1+0j,refrm=1+0j,nang = 90,ang= [],r = 1.0,lam = 1.0):
+    """
+    Реализация теории Ми на чистом NumPy.
+
+    Параметры:
+    - refrp: показатель преломления частицы (вещественный или комплексный)
+    - refrm: показатель преломления среды (обычно 1.0 для воздуха)
+    - nang: количество углов для расчёта I(θ)
+    - ang: массив углов рассеяния в радианах [0, π]
+    - r: радиус частицы (в микрометрах)
+    - lam: длина волны (в микрометрах)
+
+    Возвращает: объект optparsct с рассчитанными параметрами.
+    """
+
     opt = optparsct(nang)
+    # Размерный параметр x = 2πr/λ
     x = 2.0*pi*r/lam
+
+    # Оценка максимального номера парциальной волны (Bohren & Huffman)
     nmax = int(x+4.0*pow(x,1.0/3.0)+2.0)
+    # Комплексный относительный показатель преломления
     m = complex(refrp/refrm)
     mx = complex(x*m)
-    nd = int(max(nmax,numpy.abs(mx))+3)
+    # Расчёт цепной дроби для коэффициентов D_n (алгоритм Lentz)
+    nd = int(max(nmax,numpy.abs(mx))+3)+20 # запас для сходимости
     D = numpy.array([complex((i+1)/mx) for i in range(nd+1)])
     D[nd] = 0.0+0.0j
     for i in range(nd,0,-1):
         D[i - 1] = D[i - 1] - 1.0 / (D[i] + D[i - 1])
+
+    # Рекуррентный расчёт сферических функций Бесселя (psi_n = x j_n(x))
     psi = numpy.zeros(nd+1)
-    ksi = numpy.zeros(nd+1)
+    ksi = numpy.zeros(nd+1) # ksi_n = x h_n^(1)(x) — сферические функции Ханкеля
     psi[0]=sin(x)
     psi[1]=sin(x)/x-cos(x)
     ksi[0]=cos(x)
@@ -35,47 +67,62 @@ def miesctopt(refrp=1+0j,refrm=1+0j,nang = 90,ang= [],r = 1.0,lam = 1.0):
     for i in range(2,nd+1):
         psi[i]=((2.0*(i-1)+1.0)*psi[i-1]/x)-psi[i-2]
         ksi[i]=((2.0*(i-1)+1.0)*ksi[i-1]/x)-ksi[i-2]
+
+    # eps_n = psi_n - i * ksi_n = x * h_n^(1)(x)
     eps = numpy.array([complex(psi[i],-ksi[i]) for i in range(nd+1)])
+    # Коэффициенты Ми a_n и b_n
     ari = numpy.arange(nd+1)
     arix = ari/x
     tmp1 = D/m+arix
     tmp2 = D*m+arix
-    psis = numpy.roll(psi,1)
-    epss =  numpy.roll(eps,1)
-    a = (tmp1*psi - psis)/(tmp1*eps-epss)
-    b = (tmp2*psi - psis)/(tmp2*eps-epss)
+    psis = numpy.roll(psi,1)   # psi_{n-1}
+    epss =  numpy.roll(eps,1)  # eps_{n-1}
+    a = (tmp1*psi - psis)/(tmp1*eps-epss)  # электрические мультиполи
+    b = (tmp2*psi - psis)/(tmp2*eps-epss)  # магнитные мультиполи
 
-    ar2i1 = numpy.arange(nd+1)*2+1#numpy.array([2*i+1 for i in range(nd+1)])
-    ari = numpy.arange(nd+1)
-    ar2i1i =ari*(ari+1) #numpy.array([(i+1)*i for i in range(nd+1)])
-    ar2i1i[0] = 1
-    pqq = numpy.zeros(shape = (nang,nd+1))
-    pqs = numpy.zeros(shape = (nang,nd+1))
-    tqq = numpy.zeros(shape = (nang,nd+1))
+    # Подготовка полиномов Лежандра для углового распределения
+    ar2i1 = numpy.arange(nd+1)*2+1 # (2n+1)  #numpy.array([2*i+1 for i in range(nd+1)])
+    ar2i1i =ari*(ari+1) # n(n+1) #numpy.array([(i+1)*i for i in range(nd+1)])
+    ar2i1i[0] = 1  # избегаем деления на 0
+    pqq = numpy.zeros(shape = (nang,nd+1))  # P_n(cosθ)
+    pqs = numpy.zeros(shape = (nang,nd+1))  # P_{n-1}(cosθ)
+    tqq = numpy.zeros(shape = (nang,nd+1))  # τ_n = dP_n/dθ
     pqq[:,1] = 1.0
     cosq = numpy.array([[cos(ang[i]) for i in range(nang)]])
     for i in range(2,nd+1):
         pqq[:,i] = ((2.0*i-1.0)/(i-1.0))*cosq[0,:]*pqq[:,i-1]-i*pqq[:,i-2]/(i-1.0)
     pqs[:,1:-1] = pqq[:,0:-2]#numpy.roll(pq,1)
     tqq = cosq.T*pqq*ari- pqs*(ari+1)
+
+    # Нормировочные коэффициенты для S1 и S2
     ardiv = ar2i1/ar2i1i
+
+    # Амплитуды рассеяния S1(θ) и S2(θ)
     ss1 = (a*pqq+b*tqq)*ardiv
     ss2 = (a*tqq+b*pqq)*ardiv
     s1 = ss1.sum(axis=1)
     s2 = ss2.sum(axis=1)
-    qsct=0.0
-    qext=0.0
-    ar1 = (-1)**ari#numpy.array([(-1)**i for i in range(nd+1)])
-    qext = ((a+b).real*ar2i1).sum()
-    qsct = ((abs(a)**2+abs(b)**2)*ar2i1).sum()
-    #print("Ok")
-    qsctpic = ((a-b)*ar1*ar2i1).sum()
-    qsctpi = abs(qsctpic)**2/(x**2)
+
+    # Расчёт эффективных сечений
+    ar1 = (-1)**ari # (-1)^n
+    qext = ((a+b).real*ar2i1).sum() # Q_ext * x²/2
+    qsct = ((abs(a)**2+abs(b)**2)*ar2i1).sum()  # Q_sca * x²/2
+    qsctpic = ((a-b)*ar1*ar2i1).sum() # Σ(a_n - b_n)(-1)^n(2n+1)
+
+    # Перевод в стандартные эффективные коэффициенты
+    qsctpi = abs(qsctpic)**2/(x**2)  # Q_back
     qext=qext*2.0/x**2.0
     qsct=qsct*2.0/x**2.0
+
+    # Перевод в физические сечения (см²), с учётом масштаба 1e-8 (мкм² → см²)
     opt.sct=qsct*(r**2)*pi*1e-8
     opt.ext=qext*(r**2)*pi*1e-8
+    opt.spi1 = qsctpi*(r**2)*pi*1e-8
+
+    # Угловое распределение интенсивности
     opt.ind= abs(s1)**2+abs(s2)**2
+
+    # Нормировка I(θ): ∫ I(θ) sinθ dθ = 1
     ind1 = numpy.roll(opt.ind,-1)
     sinang = numpy.sin(ang)
     sinang1 = numpy.roll(sinang,-1)
@@ -84,8 +131,10 @@ def miesctopt(refrp=1+0j,refrm=1+0j,nang = 90,ang= [],r = 1.0,lam = 1.0):
     dang[-1] = 0
     inds = ((sinang*opt.ind+sinang1*ind1)*dang).sum()*0.5
     opt.ind = opt.ind/inds
-    opt.spi=opt.sct*opt.ind[nang-1]*2#qsctpi*(r**2)*pi*1e-8#/(4*pi)
-    opt.sctang = opt.sct * opt.ind*2
+
+    # Интенсивность в 180° (обратное рассеяние)
+    opt.spi=opt.sct*opt.ind[nang-1]*2 # dσ/dΩ в 180°  #qsctpi*(r**2)*pi*1e-8#/(4*pi)
+    opt.sctang = opt.sct * opt.ind*2 # полное дифференциальное сечение
 
     return opt
 
